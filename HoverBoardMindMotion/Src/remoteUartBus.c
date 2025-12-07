@@ -26,13 +26,44 @@
 #include "../Inc/sim_eeprom.h"
 #include "../Inc/calculation.h"
 
+#ifndef TOKEN_PASSING_ENABLED
+#define TOKEN_PASSING_ENABLED 1
+#endif
+
+#if TOKEN_PASSING_ENABLED
+#ifndef TOKEN_FRAME_TYPE
+#define TOKEN_FRAME_TYPE 3
+#endif
+#ifndef TOKEN_RING_FIRST_ID
+#define TOKEN_RING_FIRST_ID 0
+#endif
+#ifndef TOKEN_RING_LAST_ID
+#define TOKEN_RING_LAST_ID 1
+#endif
+#ifndef TOKEN_MASTER_ID
+#define TOKEN_MASTER_ID 0xFE
+#endif
+#ifndef TOKEN_BROADCAST_ID
+#define TOKEN_BROADCAST_ID 0xFF
+#endif
+#ifndef TOKEN_DISCOVERY_INTERVAL
+#define TOKEN_DISCOVERY_INTERVAL 200
+#endif
+#ifndef TOKEN_RECOVER_TIMEOUT
+#define TOKEN_RECOVER_TIMEOUT 100
+#endif
+#ifndef TOKEN_MAX_HOLD_TIME
+#define TOKEN_MAX_HOLD_TIME 5
+#endif
+#endif
+
 
 #pragma pack(1)
 
 extern uint32_t millis;
 extern uint8_t sRxBuffer[10];
 
-uint8_t bAnswerMaster = 0;
+uint8_t bNeedTelemetry = 0;
 static int16_t iReceivePos = 0;	
 
 extern int pwm;
@@ -44,7 +75,7 @@ extern int fvbat; 							// global variable for battery voltage
 extern int fitotal; 									// global variable for current dc
 extern int realspeed; 									// global variable for real Speed
 
-typedef struct {			// ´#pragma pack(1)´ needed to get correct sizeof()
+typedef struct {			// ï¿½#pragma pack(1)ï¿½ needed to get correct sizeof()
    uint8_t cStart;			//  = '/';
    //uint16_t cStart;		//  = #define START_FRAME         0xABCD
    uint8_t  iDataType;  //  0 = unique id for this data struct
@@ -53,11 +84,11 @@ typedef struct {			// ´#pragma pack(1)´ needed to get correct sizeof()
    uint8_t  wState;   // 1=ledGreen, 2=ledOrange, 4=ledRed, 8=ledUp, 16=ledDown   , 32=Battery3Led, 64=Disable, 128=ShutOff
    uint16_t checksum;
 } SerialServer2Hover;
-typedef struct {			// ´#pragma pack(1)´ needed to get correct sizeof()
+typedef struct {			// ï¿½#pragma pack(1)ï¿½ needed to get correct sizeof()
    uint8_t cStart;			//  = '/';
    //uint16_t cStart;		//  = #define START_FRAME         0xABCD
    uint8_t  iDataType;  //  1 = unique id for this data struct
-   uint8_t 	iSlave;			//  contains the slave id this message is intended for
+   uint8_t 	iSlave;		//  contains the slave id this message is intended for
    int16_t  iSpeed;
    int16_t  iSteer;
    uint8_t  wState;   // 1=ledGreen, 2=ledOrange, 4=ledRed, 8=ledUp, 16=ledDown   , 32=Battery3Led, 64=Disable, 128=ShutOff
@@ -65,30 +96,86 @@ typedef struct {			// ´#pragma pack(1)´ needed to get correct sizeof()
    uint16_t checksum;
 } SerialServer2HoverMaster;
 
-typedef struct {			// ´#pragma pack(1)´ needed to get correct sizeof()
-   uint8_t cStart;			//  = '/';
+typedef struct {			// ï¿½#pragma pack(1)ï¿½ needed to get correct sizeof()
+   uint8_t cStart;		//  = '/';
    //uint16_t cStart;		//  = #define START_FRAME         0xABCD
    uint8_t  iDataType;  //  2 = unique id for this data struct
-   uint8_t 	iSlave;			//  contains the slave id this message is intended for
+   uint8_t 	iSlave;		//  contains the slave id this message is intended for
 	 float  fBattFull;    // 10s LiIon = 42.0;
 	 float  fBattEmpty;    // 10s LiIon = 27.0;
 	 uint8_t  iDriveMode;      //  MM32: 0=COM_VOLT, 1=COM_SPEED, 2=SINE_VOLT, 3=SINE_SPEED
-   int8_t 	iSlaveNew;			//  if >= 0 contains the new slave id saved to eeprom
+   int8_t 	iSlaveNew;		//  if >= 0 contains the new slave id saved to eeprom
    uint16_t checksum;
 } SerialServer2HoverConfig;
 
 static uint8_t aReceiveBuffer[255];	//sizeof(SerialServer2Hover)
 
 #define START_FRAME         0xABCD       // [-] Start frme definition for reliable serial communication
-typedef struct{				// ´#pragma pack(1)´ needed to get correct sizeof()
+typedef struct{			// ï¿½#pragma pack(1)ï¿½ needed to get correct sizeof()
    uint16_t cStart;
-   uint8_t iSlave;		//  the slave id this message is sent from
-   int16_t iSpeed;		// 100* km/h
-   uint16_t iVolt;		// 100* V
-   int16_t iAmp;			// 100* A
-   int32_t iOdom;		// hall steps
+   uint8_t iSlave;	//  the slave id this message is sent from
+   int16_t iSpeed;	// 100* km/h
+   uint16_t iVolt;	// 100* V
+   int16_t iAmp;		// 100* A
+   int32_t iOdom;	// hall steps
    uint16_t checksum;
 } SerialHover2Server;
+
+#if TOKEN_PASSING_ENABLED
+typedef struct {
+	uint8_t cStart;
+	uint8_t iDataType;
+	uint8_t iSlave;
+	uint8_t iSender;
+	uint16_t tokenCounter;
+	uint16_t checksum;
+} SerialTokenPass;
+
+static uint8_t bHasToken = 0;
+static uint32_t iTokenTimestamp = 0;
+static uint16_t iTokenCounter = 0;
+static uint8_t iLastTokenMaster = TOKEN_MASTER_ID;
+static uint32_t iLastTokenRequest = 0;
+
+static void SendTokenFrame(uint8_t recipient, uint16_t counterValue)
+{
+	SerialTokenPass oToken;
+	oToken.cStart = '/';
+	oToken.iDataType = TOKEN_FRAME_TYPE;
+	oToken.iSlave = recipient;
+	oToken.iSender = SLAVE_ID;
+	oToken.tokenCounter = counterValue;
+	oToken.checksum = CalcCRC((uint8_t*) &oToken, sizeof(oToken) - 2);
+	UART_Send_Group((uint8_t*) &oToken, sizeof(oToken));
+}
+
+static void ReturnTokenToMaster(void)
+{
+	uint8_t resolved = iLastTokenMaster ? iLastTokenMaster : TOKEN_MASTER_ID;
+	SendTokenFrame(resolved, ++iTokenCounter);
+	iTokenTimestamp = millis;
+	bHasToken = 0;
+}
+
+static void RespondDiscovery(uint8_t targetId)
+{
+	uint8_t resolved = targetId ? targetId : TOKEN_MASTER_ID;
+	SendTokenFrame(resolved, ++iTokenCounter);
+	iTokenTimestamp = millis;
+}
+
+static void RequestTokenFromMaster(void)
+{
+	uint32_t now = millis;
+	if ((now - iLastTokenRequest) < TOKEN_DISCOVERY_INTERVAL)
+	{
+		return;
+	}
+	uint8_t resolved = iLastTokenMaster ? iLastTokenMaster : TOKEN_MASTER_ID;
+	SendTokenFrame(resolved, ++iTokenCounter);
+	iLastTokenRequest = now;
+}
+#endif
 
 
 
@@ -127,11 +214,28 @@ void RemoteUpdate(void){
 	if (millis - iTimeLastRx > SERIAL_TIMEOUT){
 		speed = 0;
 	}
-	if (bAnswerMaster)
+#if TOKEN_PASSING_ENABLED
+	if (bHasToken && bNeedTelemetry)
 	{
 		AnswerMaster();
-		bAnswerMaster = 0;
+		bNeedTelemetry = 0;
+		ReturnTokenToMaster();
 	}
+	else if (bHasToken && (millis - iTokenTimestamp) > TOKEN_MAX_HOLD_TIME)
+	{
+		ReturnTokenToMaster();
+	}
+	else if (!bHasToken && (bNeedTelemetry || (millis - iTokenTimestamp) > TOKEN_RECOVER_TIMEOUT))
+	{
+		RequestTokenFromMaster();
+	}
+#else
+	if (bNeedTelemetry)
+	{
+		AnswerMaster();
+		bNeedTelemetry = 0;
+	}
+#endif
 }
 
 extern 	uint32_t steerCounter;
@@ -192,6 +296,12 @@ void serialit(void){
 			case 0: iRxDataSize = sizeof(SerialServer2Hover);	break;
 			case 1: iRxDataSize = sizeof(SerialServer2HoverMaster);	break;
 			case 2: iRxDataSize = sizeof(SerialServer2HoverConfig);	break;
+#if TOKEN_PASSING_ENABLED
+			case TOKEN_FRAME_TYPE: iRxDataSize = sizeof(SerialTokenPass);	break;
+#endif
+			default:
+				iReceivePos = -1;
+				return;
 		}
 		return;
 	}
@@ -204,6 +314,30 @@ void serialit(void){
 	iReceivePos = -1;
 	if (iCRC == CalcCRC(aReceiveBuffer, iRxDataSize - 2))	//  first bytes except crc
 	{
+		uint8_t bCommandHandled = 0;
+#if TOKEN_PASSING_ENABLED
+		if (iRxDataType == TOKEN_FRAME_TYPE)
+		{
+			SerialTokenPass* pToken = (SerialTokenPass*) aReceiveBuffer;
+			iTokenCounter = pToken->tokenCounter;
+			iTokenTimestamp = millis;
+			if (pToken->iSender)
+			{
+				iLastTokenMaster = pToken->iSender;
+			}
+			if (pToken->iSlave == SLAVE_ID)
+			{
+				bHasToken = 1;
+				bNeedTelemetry = 1;
+			}
+			else if (pToken->iSlave == TOKEN_BROADCAST_ID)
+			{
+				RespondDiscovery(iLastTokenMaster);
+			}
+			iTimeLastRx = millis;
+			return;
+		}
+#endif
 		if (aReceiveBuffer[2] == SLAVE_ID)
 		{
 			iTimeLastRx = millis;
@@ -215,6 +349,7 @@ void serialit(void){
 					SerialServer2Hover* pData = (SerialServer2Hover*) aReceiveBuffer;
 					speed = pData->iSpeed;
 					wState = pData->wState;
+					bCommandHandled = 1;
 					break;
 				}
 				case 1: 
@@ -222,6 +357,7 @@ void serialit(void){
 					SerialServer2HoverMaster* pData = (SerialServer2HoverMaster*) aReceiveBuffer;
 					speed = pData->iSpeed;
 					wState = pData->wState;
+					bCommandHandled = 1;
 					break;
 				}
 				case 2: 
@@ -246,13 +382,21 @@ void serialit(void){
 						SLAVE_ID = pData->iSlaveNew;
 			
 					EEPROM_Write((u8*)pinstorage, 2 * 64);    //if the detection failed, the pin is still saved
+					bCommandHandled = 1;
 					break;
 				}
 			}
 			
-			//if (speed > 300) speed = 300;	else if (speed < -300) speed = -300;		// for testing this function
-			bAnswerMaster = 1;
-			iTimeLastRx = millis;  	// Reset the pwm timout to avoid stopping motors
+			if (bCommandHandled)
+			{
+				bNeedTelemetry = 1;
+#if TOKEN_PASSING_ENABLED
+				if (!bHasToken)
+				{
+					RequestTokenFromMaster();
+				}
+#endif
+			}
 		}
 	}
 }
