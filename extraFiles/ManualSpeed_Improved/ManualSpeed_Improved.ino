@@ -1,8 +1,5 @@
-//Hoverboard Manual Speed
-//designed for esp32
-//based on https://github.com/RoboDurden/Hoverboard-Firmware-Hack-Gen2.x-GD32/tree/main/Arduino%20Examples/TestSpeed
-//version 0.20240220 //added adc potentiometer support
-
+//Hoverboard Manual Speed - Versão Modificada para 4 Motores sem Díodos
+//Modificado para trocar pinos RX dinamicamente
 
 #define _DEBUG      // debug output to first hardware serial port
 //#define DEBUG_RX    // additional hoverboard-rx debug output
@@ -14,9 +11,18 @@
 #include "util.h"
 #include "hoverserial.h"
 
+// --- CONFIGURAÇÃO FÍSICA ---
 #ifndef oSerialHover
-#define oSerialHover Serial2    // ESP32 hardware port used for hoverboard bus
+#define oSerialHover Serial2    // ESP32 usa Serial2 por defeito
 #endif
+
+// Mapa de Pinos RX para os 4 Motores
+// [0] é ignorado, [1]=Motor1, [2]=Motor2, etc.
+// Verifica se estes pinos estão livres no teu ESP32!
+const int rx_pins_map[5] = {-1, 1, 2, 20, 21}; 
+const int tx_pin_shared = 19; // Pino TX único ligado a todas as placas
+
+// ---------------------------
 
 #ifndef TOKEN_PASSING_ENABLED
 #define TOKEN_PASSING_ENABLED 1
@@ -34,535 +40,252 @@
 #endif
 #endif
 
-//input method
-//serial
 #define input_serial
-//ble
-//rc receiver (PPM)
-//servo (PWM)
-//WiFi?
-//#define input_ADC //potentiometer/twisth throthle (ADC)
-//MQTT
 
+// --- CONFIGURAÇÃO DOS MOTORES ---
+// Temos 4 motores no total
+const size_t motor_count_total = 4;
+// IDs que vamos procurar (1, 2, 3 e 4)
+int motors_all[motor_count_total] = {1, 2, 3, 4};
 
-//array for motors
-//how many motors do you have
-const size_t motor_count_total = 6;
-//identify the motors by their slave number
-int motors_all[motor_count_total] = {1, 2, 3, 4, 5, 6};
-//how many right motors
-const size_t motor_count_right = 3;
-//identify the motors by their slave number
-int motors_right[motor_count_right] = {0, 2, 4};
-//how many left motors
-const size_t motor_count_left = 3;
-//identify the motors by their slave number
-int motors_left[motor_count_left] = {1, 3, 5};
-//array for speed
-int motor_speed[motor_count_total];
-//array for istate
-int slave_state[motor_count_total];
-//offset
-int motoroffset = motors_all[0] - 0;
+// Separação lógica (se quiseres controlar esquerda/direita separadamente depois)
+const size_t motor_count_left = 2;
+int motors_left[motor_count_left] = {1, 3}; // Motores ímpares na esquerda
+const size_t motor_count_right = 2;
+int motors_right[motor_count_right] = {2, 4}; // Motores pares na direita
 
+int motor_speed[10]; // array para guardar velocidades
+int slave_state[10]; // array para guardar estados
 
+// Variáveis Globais
+uint32_t iLast = 0;
+uint32_t iNext = 0;
+uint32_t iTimeNextState = 0;
+int iStep = 20;
+int iSpeed = 0;
+uint8_t wState = 1; // 1=Green, 2=Orange, 4=Red, 8=Up, 16=Down
+int count = 0;
 
-//
-int slaveidin;
-int iSpeed;
-int ispeedin;
-int istatein;
-int count=0;
-String command;
-
-#if TOKEN_PASSING_ENABLED
-#ifndef TOKEN_BROADCAST_ID
-#define TOKEN_BROADCAST_ID 0xFF
-#endif
-#ifndef TOKEN_DISCOVERY_PERIOD
-#define TOKEN_DISCOVERY_PERIOD 50UL
-#endif
-#ifndef TOKEN_DISCOVERY_DURATION
-#define TOKEN_DISCOVERY_DURATION 2000UL
-#endif
-#ifndef TOKEN_RETURN_TIMEOUT
-#define TOKEN_RETURN_TIMEOUT 40UL
-#endif
-
-static unsigned long gLastFeedback[motor_count_total];
-static bool gSlaveAlive[motor_count_total];
-static size_t gNextTokenSeed = 0;
-static uint16_t gTokenCounter = 0;
-static bool gTokenInFlight = false;
-static uint8_t gTokenTarget = 0;
-static unsigned long gTokenSendTime = 0;
-static bool gDiscoveryActive = true;
-static unsigned long gDiscoveryStart = 0;
-static unsigned long gLastDiscoveryBurst = 0;
-
-static void ResetTokenTracking(unsigned long now)
-{
-  for (size_t idx = 0; idx < motor_count_total; ++idx)
-  {
-    gLastFeedback[idx] = 0;
-    gSlaveAlive[idx] = false;
-  }
-  gNextTokenSeed = 0;
-  gTokenCounter = 0;
-  gTokenInFlight = false;
-  gTokenTarget = 0;
-  gTokenSendTime = 0;
-  gDiscoveryActive = true;
-  gDiscoveryStart = now;
-  gLastDiscoveryBurst = 0;
-}
-
-static int FindMotorSlot(int slave)
-{
-  for (size_t idx = 0; idx < motor_count_total; ++idx)
-  {
-    if (motors_all[idx] == slave)
-    {
-      return (int)idx;
-    }
-  }
-  return -1;
-}
-
-static void RecordFeedbackAge(uint8_t slave, unsigned long now)
-{
-  int slot = FindMotorSlot(slave);
-  if (slot >= 0)
-  {
-    gLastFeedback[slot] = now;
-    gSlaveAlive[slot] = true;
-  }
-}
-
-
-static void SendTokenFrame(uint8_t recipient)
-{
-  SerialTokenPass token;
-  token.cStart = '/';
-  token.iDataType = TOKEN_FRAME_TYPE;
-  token.iSlave = recipient;
-  token.iSender = TOKEN_MASTER_ID;
-  token.tokenCounter = ++gTokenCounter;
-  token.checksum = CalcCRC((uint8_t*)&token, sizeof(token) - 2);
-  oSerialHover.write((uint8_t*)&token, sizeof(token));
-}
-
-static void BroadcastDiscovery(unsigned long now)
-{
-  SendTokenFrame(TOKEN_BROADCAST_ID);
-  gLastDiscoveryBurst = now;
-}
-
-static void SendControlToken(uint8_t slave, unsigned long now)
-{
-  SendTokenFrame(slave);
-  if (slave != TOKEN_BROADCAST_ID)
-  {
-    gTokenInFlight = true;
-    gTokenTarget = slave;
-    gTokenSendTime = now;
-  }
-}
-
-static void HandleTokenFrame(const SerialTokenPass& frame, unsigned long now)
-{
-  if (frame.iSlave != TOKEN_MASTER_ID)
-  {
-    return;
-  }
-  RecordFeedbackAge(frame.iSender, now);
-  if (gTokenInFlight && gTokenTarget == frame.iSender)
-  {
-    gTokenInFlight = false;
-    gTokenTarget = 0;
-  }
-}
-
-static void PumpTokenFrames(unsigned long now)
-{
-  SerialTokenPass received;
-  while (ReceiveTokenFrame(oSerialHover, received))
-  {
-    HandleTokenFrame(received, now);
-  }
-}
-
-static bool SlaveIsResponsive(size_t idx, unsigned long now)
-{
-  return gSlaveAlive[idx] && (now - gLastFeedback[idx]) <= TOKEN_STALE_TIMEOUT;
-}
-
-static void ServiceTokenScheduler(unsigned long now)
-{
-  if (gDiscoveryActive)
-  {
-    if ((now - gLastDiscoveryBurst) > TOKEN_DISCOVERY_PERIOD)
-    {
-      BroadcastDiscovery(now);
-    }
-    if ((now - gDiscoveryStart) > TOKEN_DISCOVERY_DURATION)
-    {
-      gDiscoveryActive = false;
-    }
-    return;
-  }
-
-  if (gTokenInFlight)
-  {
-    if ((now - gTokenSendTime) > TOKEN_RETURN_TIMEOUT)
-    {
-      gTokenInFlight = false;
-      gTokenTarget = 0;
-    }
-    else
-    {
-      return;
-    }
-  }
-
-  for (size_t step = 0; step < motor_count_total; ++step)
-  {
-    size_t idx = (gNextTokenSeed + step) % motor_count_total;
-    if (!SlaveIsResponsive(idx, now))
-    {
-      continue;
-    }
-    SendControlToken(motors_all[idx], now);
-    gNextTokenSeed = (idx + 1) % motor_count_total;
-    return;
-  }
-}
-#endif
 SerialHover2Server oHoverFeedback;
+SerialHover2Server oHoverFeedbackAll[10]; // Guarda feedback de até 10 motores
+uint32_t iHoverFeedbackAges[10];
 
+// Protótipos
+void ServiceTokenScheduler(uint32_t iNow);
+void RecordFeedbackAge(uint8_t id, uint32_t iNow);
 
-
-void setup()
+// ==========================================================
+// SETUP
+// ==========================================================
+void setup() 
 {
-  #ifdef _DEBUG
-    Serial.begin(115200);
-    Serial.println("Hello Hoverbaord V2.x :-)");
-  #endif
-  pinMode(20, INPUT_PULLUP); // Tenta ligar o resistor interno
-  pinMode(19, INPUT_PULLUP);
+  Serial.begin(115200);
+  Serial.println("Hoverboard Serial v2.0 - 4 Motor Logic (No Diodes)");
 
-#ifdef input_serial
-  HoverSetupEsp32(oSerialHover,19200,20,19);
-#endif
-
-#if TOKEN_PASSING_ENABLED
-  ResetTokenTracking(millis());
-#endif
-
-#ifdef input_ADC
-  int min_speed  = -1000;
-  int max_speed = 1000;
-  //set both pins the same if you only have 1 adc
-  int adc_input_pin_right = 36;
-  int adc_input_pin_left = 37;
-  HoverSetupEsp32(oSerialHover,19200,16,17);
-
-  #endif
+  // Inicializa a Serial do Hoverboard
+  // Começamos por defeito a ouvir o Motor 1 (Pino 16)
+  HoverSetupEsp32(oSerialHover, 19200, rx_pins_map[1], tx_pin_shared);
+  
+  // Limpa arrays
+  for(int i=0; i<10; i++) {
+    motor_speed[i] = 0;
+    slave_state[i] = 0; // 0 = COM_VOLT mode usually
+    iHoverFeedbackAges[i] = 0;
+  }
 }
 
-
-unsigned long iLast = 0;
-unsigned long iNext = 0;
-unsigned long iTimeNextState = 3000;
-uint8_t  wState = 1;   // 1=ledGreen, 2=ledOrange, 4=ledRed, 8=ledUp, 16=ledDown, 32=Battery3Led, 64=Disable, 128=ShutOff
-//id for messages being sent
-uint8_t  iSendId = 0;   // only ofr UartBus
-
-void loop()
+// ==========================================================
+// LOOP PRINCIPAL
+// ==========================================================
+void loop() 
 {
-  unsigned long iNow = millis();
-#if TOKEN_PASSING_ENABLED
-  PumpTokenFrames(iNow);
-#endif
-  //digitalWrite(39, (iNow%500) < 250);
-  //digitalWrite(37, (iNow%500) < 100);
+  uint32_t iNow = millis();
 
-//look for incoming serial command
-//hover|slave/motorid|speed|state
-//speed can be from -1000 reverse full speed to 1000 forward full speed
-//state can be 1=ledGreen, 2=ledOrange, 4=ledRed, 8=ledUp, 16=ledDown, 32=Battery3Led, 64=Disable, 128=ShutOff
+  // 1. Processa inputs do Computador (USB)
+  #ifdef input_serial
+    if (Serial.available()) {
+      String command = Serial.readStringUntil('\n');
+      // Formato: hover|id|speed|state
+      // Exemplo: hover|all|300|1  OU  hover|1|100|1
+      
+      if (command.startsWith("hover")) {
+        int firstPipe = command.indexOf('|');
+        int secondPipe = command.indexOf('|', firstPipe + 1);
+        int thirdPipe = command.indexOf('|', secondPipe + 1);
+        int fourthPipe = command.indexOf('|', thirdPipe + 1);
 
+        String idStr = command.substring(firstPipe + 1, secondPipe);
+        int speedVal = command.substring(secondPipe + 1, thirdPipe).toInt();
+        int stateVal = command.substring(thirdPipe + 1).toInt();
 
-#ifdef input_serial
-//read serial input
-  if (Serial.available()) { // if there is data comming
-    String command = Serial.readStringUntil('\n'); // read string until newline character
-// check if input starts with hover
-//if the hover command is present parse the input data
-    if (command.substring(0,6) == "hover|") {
-      //Serial.println("Command hover parse the data");
-      //Serial.println(command);
-      //remove the command
-      //start at 0 remove 6 char for hover|
-      command.remove(0,6);
-      //Serial.println(command);
-
-        if (command.substring(0,4) == "all|") //all
-        {
-          //remove all|
-          command.remove(0,4);
-          //parse the date
-          int numParsed = sscanf(command.c_str(), "%d|%d", &ispeedin, &istatein);
-          //verify we parsed 2 numbers
-          if (numParsed == 2)
-          {
-            //set the data
-            count = 0;
-            while (count < motor_count_total)
-            {
-              //set motor speed
-            motor_speed[count] = ispeedin;
-             //set motor/mcu state
-            slave_state[count] = istatein;  
-              //increase count
-              count++;
-            } 
-          }
-          else
-          {
-            //present an error
-            Serial.println("The command doesn't meet the criteria"); 
-          }
-
+        if (idStr == "all") {
+           for (int i = 0; i < motor_count_total; i++) {
+             motor_speed[motors_all[i]] = speedVal;
+             slave_state[motors_all[i]] = stateVal;
+           }
+           Serial.println("All motors updated");
+        } else if (idStr == "left") {
+           for (int i = 0; i < motor_count_left; i++) {
+             motor_speed[motors_left[i]] = speedVal;
+             slave_state[motors_left[i]] = stateVal;
+           }
+        } else if (idStr == "right") {
+           for (int i = 0; i < motor_count_right; i++) {
+             motor_speed[motors_right[i]] = speedVal;
+             slave_state[motors_right[i]] = stateVal;
+           }
+        } else if (idStr == "stop") {
+           for(int i=0; i<10; i++) motor_speed[i] = 0;
+           Serial.println("STOP");
+        } else {
+           int id = idStr.toInt();
+           if(id > 0 && id < 10) {
+             motor_speed[id] = speedVal;
+             slave_state[id] = stateVal;
+             Serial.print("Motor "); Serial.print(id); Serial.println(" updated");
+           }
         }
-        else if (command.substring(0,6) == "right|") //right
-        { 
-          //remove right|
-          command.remove(0,6);
-          //parse the date
-          int numParsed = sscanf(command.c_str(), "%d|%d", &ispeedin, &istatein);  
-          //verify we parsed 2 numbers
-          if (numParsed == 2)
-          {
-            //set the data
-            count = 0;
-            while (count < motor_count_right)
-            {
-              //set motor speed
-              motor_speed[motors_right[count]-motoroffset] = ispeedin;
-             //set motor/mcu state
-            slave_state[motors_right[count]-motoroffset] = istatein;                
-              //increase count
-              count++;
-            } 
-          }
-          else
-          {
-            //present an error
-            Serial.println("The command doesn't meet the criteria"); 
-          }
-
-        }
-        else if (command.substring(0,5) == "left|") //left
-        { 
-          //remove left|
-          command.remove(0,5);
-          //parse the date
-          int numParsed = sscanf(command.c_str(), "%d|%d", &ispeedin, &istatein);
-          //verify we parsed 2 numbers
-          if (numParsed == 2)
-          {
-            //set the data
-            count = 0;
-            while (count < motor_count_left)
-            {
-              //set motor speed
-              motor_speed[motors_left[count]-motoroffset] = ispeedin;
-             //set motor/mcu state
-            slave_state[motors_left[count]-motoroffset] = istatein;                
-              //increase count
-              count++;
-            } 
-          }
-          else
-          {
-            //present an error
-            Serial.println("The command doesn't meet the criteria"); 
-          }
-        }
-        else //single number motor specified
-        {
-        int numParsed = sscanf(command.c_str(), "%d|%d|%d", &slaveidin, &ispeedin, &istatein);
-  
-            if (numParsed == 3) {
-            //set motor speed
-            motor_speed[slaveidin-motoroffset] = ispeedin; 
-             //set motor/mcu state
-            slave_state[slaveidin-motoroffset] = istatein; 
-            } 
-            else {
-            // Handle parsing error
-            Serial.println("The command doesn't meet the criteria");
-            }
-        }
-} 
-  else if (command.substring(0,6) == "stop")
-  {
-     //set the data
-            count = 0;
-            while (count < motor_count_total)
-            {
-              //set motor speed
-              motor_speed[count] = 0;
-             //set motor/mcu state
-            slave_state[count] = istatein;                
-              //increase count
-              count++;
-            } 
-  }
-else {
-      Serial.println("Command not hover/stop");
-      Serial.println(command);
-  
+      } else if (command.startsWith("stop")) {
+           for(int i=0; i<10; i++) motor_speed[i] = 0;
+           Serial.println("STOP ALL");
+      }
     }
-  #ifdef _DEBUG
-int i = 0;
-  while (i < motor_count_total)
-  {
-    Serial.print("Motor ");
-    Serial.print(motors_all[i]);
-    Serial.print(" Speed is set to ");
-    Serial.print(motor_speed[i]);
-    Serial.print(" Slave state is set to ");
-    Serial.println(slave_state[i]);
-    i++;
-  }
-#endif
-  }
-
-
-#endif
-
-#ifdef input_adc
-    // read the input on analog pin:
-  int analogValueRight = analogRead(adc_input_pin_right);
-  int analogValueLeft = analogRead(adc_input_pin_left);
-  // Rescale to potentiometer's
-  int deadband = 100; //this the the range in the middle that will output zero
-  if (abs(analogValueRight-(4095/2))<deadband){//make it easier to get to 0
-//1997.5 < input < 2097.5
-    float adcspeedinright = 0;
-  }
-  else{
-  float adcspeedinright = map(analogValueRight,0,4095,min_speed,max_speed);
-  }
-  if (abs(analogValueLeft-(4095/2))<deadband){//make it easier to get to 0
-//1997.5 < input < 2097.5
-    float adcspeedinleft = 0;
-  }
-  else{
-  float adcspeedinright = map(analogValueLeft,0,4095,min_speed,max_speed);
-  }
-
-  
-  #ifdef _DEBUG
-    // print out the value you read:
-    Serial.print("Analog Right: ");
-    Serial.print(analogValueRight);
-    Serial.print(", Speed: ");
-    Serial.println(adcspeedinright);
-    delay(1000);
-    Serial.print("Analog Left: ");
-    Serial.print(analogValueLeft);
-    Serial.print(", Speed: ");
-    Serial.println(adcspeedinleft);
-    delay(1000);
   #endif
-//set the values
 
-   //right
-            count = 0;
-            while (count < motor_count_right)
-            {
-              //set motor speed
-              motor_speed[motors_right[count]-motoroffset] = adcspeedinright;
-             //set motor/mcu state
-            //slave_state[motors_right[count]-motoroffset] = istatein;                
-              //increase count
-              count++;
-            } 
-  //left
-            count = 0;
-            while (count < motor_count_left)
-            {
-              //set motor speed
-              motor_speed[motors_left[count]-motoroffset] = adcspeedinleft;
-             //set motor/mcu state
-            //slave_state[motors_left[count]-motoroffset] = istatein;                
-              //increase count
-              count++;
-            } 
-  
-  #endif
-  
-
-  int iSteer =0;   // repeats from +100 to -100 to +100 :-)
-  //int iSteer = 0;
-  //int iSpeed = 500;
-  //int iSpeed = 200;
-  //iSpeed = iSteer = 0;
-
-  if (iNow > iTimeNextState)
-  {
-    iTimeNextState = iNow + 3000;
-    wState = wState << 1;
-    if (wState == 64) wState = 1;  // remove this line to test Shutoff = 128
-  }
-  
+  // 2. Recebe dados do Hoverboard (Leitura)
   boolean bReceived;   
-  while (bReceived = Receive(oSerialHover,oHoverFeedback))
+  while (bReceived = Receive(oSerialHover, oHoverFeedback))
   {
-    DEBUGT("millis",iNow-iLast);
-    DEBUGT("iSpeed",iSpeed);
-    //DEBUGT("iSteer",iSteer);
+    // Debug para ver se recebemos algo
+    DEBUGT("RX ID", oHoverFeedback.iSlave);
+    //DEBUGT("Speed", oHoverFeedback.iSpeed);
     HoverLog(oHoverFeedback);
-#if TOKEN_PASSING_ENABLED
-    RecordFeedbackAge(oHoverFeedback.iSlave, iNow);
-#endif
+    // Guarda os dados na cache global
+    if (oHoverFeedback.iSlave >= 1 && oHoverFeedback.iSlave <= 4) {
+        memcpy(&oHoverFeedbackAll[oHoverFeedback.iSlave], &oHoverFeedback, sizeof(SerialHover2Server));
+    }
+
+    #if TOKEN_PASSING_ENABLED
+      RecordFeedbackAge(oHoverFeedback.iSlave, iNow);
+    #endif
     iLast = iNow;
   }
 
+  // 3. Envia Comandos de Velocidade (Broadcast)
+  // Isto envia os comandos de velocidade periodicamente, independente do token
   if (iNow > iNext)
   {
-    //DEBUGLN("time",iNow)
+    // Envia comandos para todos os motores definidos
+    for (int i = 0; i < motor_count_total; i++) {
+        int id = motors_all[i];
+        
+        // Constrói pacote de comando
+        SerialServer2HoverMaster oCommand;
+        oCommand.cStart = '/';
+        oCommand.iDataType = 1; // Tipo 1 = Master Control
+        oCommand.iSlave = id;
+        oCommand.iSpeed = motor_speed[id];
+        oCommand.iSteer = 0; // Não usamos steer neste modo, controlamos direto a velocidade
+        oCommand.wState = slave_state[id]; // LED/Estado
+        oCommand.wStateSlave = slave_state[id]; 
+        oCommand.checksum = CalcCRC((uint8_t*)&oCommand, sizeof(oCommand)-2);
+
+        // Envia para o barramento
+        UART_Send((uint8_t*)&oCommand, sizeof(oCommand)); 
+        
+        // Pequeno delay para não engasgar o buffer de TX
+        delayMicroseconds(500);
+    }
     
-    #ifdef REMOTE_UARTBUS
-      count = 0;
-      while (count < motor_count_total){
-         HoverSend(oSerialHover,motors_all[count],motor_speed[count],slave_state[count]);
-//           #ifdef _DEBUG
-//                Serial.print("Sent Motor ");
-//                Serial.print(motors_all[count]);
-//                Serial.print(" Speed ");
-//                Serial.print(motor_speed[count]);
-//                Serial.print (" and Slave State ");
-//                Serial.println(slave_state[count]);
-//            #endif
-                   count ++;  
-      }
-
-
-      iNext = iNow + SEND_MILLIS/2;
-    #else
-      //if (bReceived)  // Reply only when you receive data
-        HoverSend(oSerialHover,iSteer,iSpeed,wState,wState);
-      
-      iNext = iNow + SEND_MILLIS;
-    #endif
+    iNext = iNow + SEND_MILLIS;
   }
-    #if TOKEN_PASSING_ENABLED
-      ServiceTokenScheduler(iNow);
-    #endif
 
+  // 4. Gestão do Token (Quem pode falar?)
+  #if TOKEN_PASSING_ENABLED
+    ServiceTokenScheduler(iNow);
+  #endif
+}
 
+// ==========================================================
+// FUNÇÕES AUXILIARES
+// ==========================================================
+
+void UART_Send(uint8_t *pBuffer, uint8_t size) {
+    oSerialHover.write(pBuffer, size);
+}
+
+void SendTokenFrame(uint8_t recipient, uint16_t counterValue)
+{
+  SerialTokenPass oToken;
+  oToken.cStart = '/';
+  oToken.iDataType = TOKEN_FRAME_TYPE;
+  oToken.iSlave = recipient;
+  oToken.iSender = TOKEN_MASTER_ID;
+  oToken.tokenCounter = counterValue;
+  oToken.checksum = CalcCRC((uint8_t*) &oToken, sizeof(oToken) - 2);
+  UART_Send((uint8_t*) &oToken, sizeof(oToken));
+}
+
+// --- GESTÃO DE TOKENS E MUDANÇA DE PINO ---
+static uint8_t iNextTokenIndex = 0;
+static uint32_t iNextTokenTime = 0;
+static uint16_t iTokenCounter = 0;
+static uint32_t iWaitResponseTimeout = 0;
+
+// Tempo máximo para esperar resposta de um escravo (em ms)
+// Aumenta se tiveres erros de CRC, diminui para mais velocidade
+#define TOKEN_RETURN_TIMEOUT 40 
+
+void ServiceTokenScheduler(uint32_t iNow)
+{
+  // Verifica se estamos à espera de uma resposta e se já passou o tempo (Timeout)
+  if (iWaitResponseTimeout > 0 && iNow > iWaitResponseTimeout) {
+      // Timeout! O motor não respondeu. Passa para o próximo.
+      // DEBUGT("Timeout ID", motors_all[iNextTokenIndex]);
+      
+      iNextTokenIndex++;
+      if (iNextTokenIndex >= motor_count_total) iNextTokenIndex = 0;
+      
+      iWaitResponseTimeout = 0; // Reseta timeout para permitir envio imediato
+      iNextTokenTime = iNow;    // Envia próximo já
+  }
+
+  // Se estiver pronto para enviar novo token
+  if (iWaitResponseTimeout == 0 && iNow >= iNextTokenTime)
+  {
+      uint8_t targetId = motors_all[iNextTokenIndex];
+      
+      // === A MÁGICA ACONTECE AQUI ===
+      // Antes de pedir ao motor para falar, mudamos o ouvido (RX) do ESP32!
+      if(targetId >= 1 && targetId <= 4) {
+          // Muda o pino RX para o que está ligado ao motor alvo
+          // Mantém o TX no pino partilhado (17)
+          oSerialHover.setPins(rx_pins_map[targetId], tx_pin_shared); 
+      }
+      // ==============================
+
+      // Envia o Token (Permissão para falar)
+      SendTokenFrame(targetId, ++iTokenCounter);
+      
+      // Define o timeout: se ele não responder em X ms, desistimos dele
+      iWaitResponseTimeout = iNow + TOKEN_RETURN_TIMEOUT;
+  }
+}
+
+void RecordFeedbackAge(uint8_t id, uint32_t iNow) {
+    // Esta função é chamada quando recebemos dados com sucesso
+    if (id == motors_all[iNextTokenIndex]) {
+        // Se recebemos do motor que esperávamos:
+        // 1. Limpa o timeout (já não precisamos esperar)
+        iWaitResponseTimeout = 0;
+        
+        // 2. Agenda o próximo motor imediatamente
+        iNextTokenIndex++;
+        if (iNextTokenIndex >= motor_count_total) iNextTokenIndex = 0;
+        iNextTokenTime = iNow + 2; // Espera 2ms só para estabilidade elétrica
+        
+        // DEBUGT("Success ID", id);
+    }
+    
+    if (id < 10) iHoverFeedbackAges[id] = iNow;
 }
