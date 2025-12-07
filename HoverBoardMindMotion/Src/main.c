@@ -58,8 +58,20 @@ extern uint8_t lowbatperm;
 //  change EEPROMEN to 0
 #define EEPROMEN 1
 //  copy pinstorage initializer from autodetect and replace the default line below
-uint16_t pinstorage[64]={0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xDCAB, 31, 250, 0, 19200, 8192, 1, 30, 0, 10, 300, 1, 1, 42000, 32000, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-////////////////////////////////////////////////////////////////////////////////////////////
+
+uint16_t pinstorage[64] = {
+    26, 28, 27, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 18, 65535, 14, 65535, 19, 17,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    56491, 31, 250, 0, 19200,
+    8192,   // �ndice 38
+    4,      // �ndice 39 (corrigido)
+    30, 0, 10, 300,
+    1, 3, 42000, 32000, 1000,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0
+};
 
 
 s32 main(void){
